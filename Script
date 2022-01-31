@@ -1,0 +1,198 @@
+# -*- coding: utf-8 -*-
+"""
+Last edited by Calvin Wong on Decembe 17, 2019
+Made on Python 3.6
+
+Created to calibrate the USGS Dynamic Surface Water Extent algorithm to 
+Sentinel-2 data. It uses Monte Carlo simulation to randomize thresholds within
+20% of the USGS defaults, deciding upon the best set using the ratio of
+high-confidence pixels within ground truth (lakes). A higher ratio of high-
+confidence pixels within lakes is desirable. 
+
+"""
+#import modules
+import arcpy as ap
+import os
+from arcpy.sa import *
+import numpy as np
+import random
+import datetime
+from operator import itemgetter
+
+ap.env.workspace = ap.GetParameterAsText(1)
+ap.env.overwriteOutput = 'true'
+
+#set path to the location of Sentinel 2 bands
+path = ap.GetParameterAsText(0) # path to Sentinel 2 20m rasters
+#geodatabase = "D:\Projects\DepressionStorageRemoteSensing\GISData\DepressionsRemoteSensing\DepressionsRemoteSensing.gdb"
+finalfiles = ap.GetParameterAsText(1) # file to contain final products
+
+def bandsearch(ending):
+    """search for files that end with a certain Sentine-2 band naming
+    convention"""
+    for file in os.listdir(path):
+        if file.endswith(ending):
+            return file
+
+#create raster objects from the necessary bands, assuming the naming convention  
+blue = Raster(os.path.join(path, bandsearch("B02_20m.jp2")))
+green = Raster(os.path.join(path, bandsearch("B03_20m.jp2")))
+red = Raster(os.path.join(path, bandsearch("B04_20m.jp2")))
+NIR = Raster(os.path.join(path, bandsearch("B8A_20m.jp2")))
+SWIR1 = Raster(os.path.join(path, bandsearch("B11_20m.jp2")))
+SWIR2 = Raster(os.path.join(path, bandsearch("B12_20m.jp2")))
+
+#set extent
+ap.env.extent = blue
+
+#define functions to get the upper and lower bounds of calibration
+def up20(number):
+    """Take a number and get 20% above it"""
+    return(number*1.2)
+def down20(number):
+    """Take a number and get 20% below it"""
+    return(number*.8)
+    
+#perform raster algebra to make indexes and spectral relationships
+mndwi = (green - SWIR1) / (green + SWIR1) #modified normalized difference wetness index
+mbsrv = green + red #multi-band spectral relationship visible
+mbsrn = NIR + SWIR1 #multi-band spectral relationship near-infrared
+ndvi = (NIR - red) / (NIR + red) #normalized difference vegetation index
+awesh = blue + (green * 2.5) + (mbsrn * -1.5) + (SWIR2 * -0.25) #automated water extent shadow
+
+
+x = 1
+values = []
+simulations = int(ap.GetParameterAsText(2))
+
+###################Run Monte Carlo calibration#############################
+while x < simulations:
+    print("Calibration run " + str(x))
+    a = datetime.datetime.now()
+    #the following variables pick a random number from within a uniform distribution of possible
+    #   values as defined by the USGS documentation
+    mndwiThresh1 = round(random.uniform(down20(0.124),up20(0.124)),3)
+    aweshThresh = round(random.uniform(down20(0),up20(0)),1)
+    mndwiThresh2 = round(random.uniform(down20(-0.44),up20(-0.44)),2)
+    swir1Thresh1 = round(random.uniform(down20(900),up20(900)),0)
+    nirThresh1 = round(random.uniform(down20(1500),up20(1500)),0)
+    ndviThresh = round(random.uniform(down20(0.7),up20(0.7)),1)
+    mndwiThresh3 = round(random.uniform(down20(-0.5),up20(-0.5)),1)
+    blueThresh = round(random.uniform(down20(1000),up20(1000)),0)
+    swir1Thresh2 = round(random.uniform(down20(3000),up20(3000)),0)
+    swir2Thresh = round(random.uniform(down20(1000),up20(1000)),0)
+    nirThresh2 = round(random.uniform(down20(2500),up20(2500)),0)
+
+#make new rasters based on conditional statements. A total of 5 tests are performed,
+#   with each digit representing a pass or fail of a test. For example,
+#   10001 means the ones test and tenthousands test was passed
+    ones = Con(mndwi > mndwiThresh1, 1, 0)
+    tens = Con(mbsrv > mbsrn, 10, 0)
+    hundreds = Con(awesh > aweshThresh, 100, 0)
+    thousands = Con((mndwi > mndwiThresh2) & (SWIR1 < swir1Thresh1) & 
+                    (NIR < nirThresh1) & (ndvi < ndviThresh), 1000, 0)
+    tenthousands = Con((mndwi > mndwiThresh3) & (blue < blueThresh) & 
+                       (SWIR1 < swir1Thresh2) & (SWIR2 < swir2Thresh) & 
+                       (NIR < nirThresh2), 10000, 0)
+
+#add the digits (rasters) together to get a final raster with 5 digit 
+#   values denoting pass-fail
+    DSWE = ones + tens + hundreds + thousands + tenthousands
+    DSWE.save(os.path.join(finalfiles, 'DSWE.tif'))
+
+#reclass the values to descriptive categories. 0=No Water, 1=High Confidence Water
+#   2=Moderate Confidence Water, 3=Potential Wetland, 4=Low Confidence Water
+    newvalues = RemapValue([[1,0],[10,0],[100,0],[1000,0],[1111,1],[10111,1],[11011,1],
+                 [11101,1],[11110,1],[11111,1],[111,2],[1011,2],[1101,2],[1110,2],
+                 [10011,2],[10101,2],[10110,2],[11001,2],[11010,2],[11100,2],
+                 [11000,3],[11,4],[101,4],[110,4],[1001,4],[1010,4],
+                 [1100,4],[10000,4],[10001,4],[10010,4],[10100,4]])
+    
+    outReclass = Reclassify(DSWE, "VALUE", newvalues, "")
+    reclassSave = os.path.join(finalfiles, 'DSWEReclass.tif')
+    outReclass.save(reclassSave)
+
+
+
+#################Quantification of success##########################
+    
+#get proportion of high confidence pixels in lakes
+#clip reclassified raster to lakes dataset
+    clipLakes = ap.GetParameterAsText(3)
+    fcSave = os.path.join(finalfiles, 'ReclassClip.tif')
+    fc = ap.Clip_management(reclassSave, "#", fcSave, clipLakes, "15", "ClippingGeometry", "NO_MAINTAIN_EXTENT")
+    ap.BuildRasterAttributeTable_management(fc, "Overwrite")
+                            
+#get a proportion of high confidence pixels in the lakes
+    numerator = []
+    denominator = []
+    
+    with ap.da.SearchCursor(fc, ["Value", "Count"]) as cursor:
+        for row in cursor:
+            if row[0] == 1:
+                numerator.append(row[1])
+                denominator.append(row[1])
+            else:
+                denominator.append(row[1])
+    del cursor
+    try:
+        ratio = numerator[0]/sum(denominator)
+    except IndexError:
+        ratio = 0
+    array = [ratio, mndwiThresh1, aweshThresh, mndwiThresh2, swir1Thresh1,
+    nirThresh1, ndviThresh, mndwiThresh3, blueThresh, swir1Thresh2,
+    swir2Thresh, nirThresh2]
+    
+    values.append(array)
+    b = datetime.datetime.now()
+    c = b-a
+    print(str(c.total_seconds()) + " seconds to run")
+    x+=1
+   
+#save an array of the simulations tested
+final = np.asarray(values)
+np.save(os.path.join(finalfiles, 'calibration'), final)
+
+#get best threshold values
+finalsort = sorted(values, key=itemgetter(0), reverse = True)
+best = finalsort[0]
+print(finalsort[0])
+
+#use the best thresholds to classify water
+mndwiThresh1 = best[1]
+aweshThresh = best[2]
+mndwiThresh2 = best[3]
+swir1Thresh1 = best[4]
+nirThresh1 = best[5]
+ndviThresh = best[6]
+mndwiThresh3 = best[7]
+blueThresh = best[8]
+swir1Thresh2 = best[9]
+swir2Thresh = best[10]
+nirThresh2 = best[11]
+
+ones = Con(mndwi > mndwiThresh1, 1, 0)
+tens = Con(mbsrv > mbsrn, 10, 0)
+hundreds = Con(awesh > aweshThresh, 100, 0)
+thousands = Con((mndwi > mndwiThresh2) & (SWIR1 < swir1Thresh1) & 
+                (NIR < nirThresh1) & (ndvi < ndviThresh), 1000, 0)
+tenthousands = Con((mndwi > mndwiThresh3) & (blue < blueThresh) & 
+                   (SWIR1 < swir1Thresh2) & (SWIR2 < swir2Thresh) & 
+                   (NIR < nirThresh2), 10000, 0)
+
+#add the digits (rasters) together to get a final raster with 5 digit 
+#   values denoting pass-fail
+DSWE = ones + tens + hundreds + thousands + tenthousands
+DSWE.save(os.path.join(finalfiles, 'DSWE.tif'))
+
+#reclass the values to descriptive categories. 0=No Water, 1=High Confidence Water
+#   2=Moderate Confidence Water, 3=Potential Wetland, 4=Low Confidence Water
+newvalues = RemapValue([[1,0],[10,0],[100,0],[1000,0],[1111,1],[10111,1],[11011,1],
+             [11101,1],[11110,1],[11111,1],[111,2],[1011,2],[1101,2],[1110,2],
+             [10011,2],[10101,2],[10110,2],[11001,2],[11010,2],[11100,2],
+             [11000,3],[11,4],[101,4],[110,4],[1001,4],[1010,4],
+             [1100,4],[10000,4],[10001,4],[10010,4],[10100,4]])
+
+outReclass = Reclassify(DSWE, "VALUE", newvalues, "")
+reclassSave = ap.GetParameterAsText(4)
+outReclass.save(reclassSave)
